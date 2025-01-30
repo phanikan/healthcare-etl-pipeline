@@ -1,0 +1,98 @@
+version: '3.8'
+
+# Healthcare Claims ETL Pipeline — Docker Compose
+# Starts: PostgreSQL (data warehouse) + Apache Airflow (orchestration)
+#
+# Usage:
+#   docker-compose up -d
+#   Open Airflow UI: http://localhost:8080  (admin/admin)
+#   Open pgAdmin:    http://localhost:5050
+
+services:
+
+  # ── PostgreSQL Data Warehouse ─────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: healthcare_dw
+    environment:
+      POSTGRES_DB:       healthcare_dw
+      POSTGRES_USER:     etl_user
+      POSTGRES_PASSWORD: etl_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docs/init_schema.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d healthcare_dw"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── pgAdmin (optional DB GUI) ─────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    admin@kphani.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+
+  # ── Airflow Webserver ─────────────────────────────────────────────────────
+  airflow-webserver:
+    image: apache/airflow:2.7.3
+    container_name: airflow_webserver
+    command: webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR:                  LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:      postgresql+psycopg2://etl_user:etl_password@postgres/healthcare_dw
+      AIRFLOW__CORE__FERNET_KEY:                ""
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG:        "true"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      DB_HOST:     postgres
+      DB_PORT:     "5432"
+      DB_NAME:     healthcare_dw
+      DB_USER:     etl_user
+      DB_PASSWORD: etl_password
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/dags/src
+      - ./data:/opt/airflow/data
+      - ./logs:/opt/airflow/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── Airflow Scheduler ─────────────────────────────────────────────────────
+  airflow-scheduler:
+    image: apache/airflow:2.7.3
+    container_name: airflow_scheduler
+    command: scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR:             LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://etl_user:etl_password@postgres/healthcare_dw
+      DB_HOST:     postgres
+      DB_PORT:     "5432"
+      DB_NAME:     healthcare_dw
+      DB_USER:     etl_user
+      DB_PASSWORD: etl_password
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/dags/src
+      - ./data:/opt/airflow/data
+      - ./logs:/opt/airflow/logs
+    depends_on:
+      - airflow-webserver
+
+volumes:
+  postgres_data:
