@@ -1,130 +1,143 @@
 # healthcare-etl-pipeline
 
-Python pipeline that pulls healthcare insurance claims from CSV exports, cleans them, and loads into PostgreSQL. Also writes parquet files to Azure Data Lake for the BI team.
+Python pipeline for processing healthcare insurance claims. Pulls from CSV exports, cleans and validates the data, loads into PostgreSQL. Also writes parquet files to Azure Data Lake for the BI team.
 
 ---
 
 ## why I built this
 
-At my last client (a healthcare insurance company, calling them MedCore here) we had claims data coming in through a mix of system exports and manual uploads. The processing "pipeline" was basically a few SQL scripts on a scheduler and someone checking the output every morning.
+At my last healthcare client I'm calling MedCore, the claims pipeline was basically three SQL scripts running on Windows Task Scheduler with someone checking a report manually every morning. It mostly worked until it didn't.
 
-It mostly worked but the failure mode was bad. When something broke the pipeline would silently drop records or continue with bad data. You'd find out 2 days later when a dashboard number looked off. By then the claims had already gone out wrong.
+The real problem wasn't that the data was messy. Healthcare data is always messy. The problem was nobody knew when something failed. A script would die at 2am, no alert, and we'd find out the next afternoon because a claim count looked wrong in a Power BI dashboard. By then the bad records were already downstream.
 
-I kept thinking about how to fix this properly and eventually just built it. The main thing I wanted was visibility - know what went in, what got rejected and why, what came out. So every run now produces a quality score and any record that can't be cleaned goes to a quarantine table with a reason, not just quietly dropped.
+I built this so there's actual visibility into what's happening. Every run logs what came in, what got filtered and why, and what made it through. Anything the pipeline can't fix goes into a quarantine table with a reason code. Not dropped silently, not buried in a log file nobody reads.
 
-This repo is a cleaned-up version of that work. The real system had more source types and messier edge cases but the core approach is the same.
+Worth saying upfront: the Airflow part is more illustrative than production ready. I've worked with Airflow on real projects but this DAG would need proper secrets management and a separate metadata database before I'd actually deploy it.
 
 ---
 
 ## what it does
 
-- reads claims from CSV exports (handles a few different column formats from different source systems)
-- removes duplicates on claim_id - had a double-submission problem at MedCore
-- fixes ICD-10 codes - the export was stripping decimals so E11.9 came in as E119, had to detect and correct
-- IQR-based anomaly scoring on claim amounts to catch obvious data entry errors
-- upserts to postgres instead of truncate-reload so a mid-run failure doesn't wipe the table
-- parquet export to Azure Data Lake, partitioned by date
-- Airflow DAG for scheduling with a data quality gate before the transform step runs
+Takes raw claims CSVs, validates and cleans them, loads them into a star schema in PostgreSQL. Runs daily via Airflow. A parquet copy goes to Azure Data Lake for the BI team to query.
+
+The four things it specifically handles are the ones I kept running into at MedCore.
+
+Duplicate claims come in constantly when you have multiple source systems feeding the same warehouse. The same claim gets submitted twice with slightly different timestamps and the pipeline needs to catch that before load.
+
+ICD-10 formatting issues are usually a system export problem, something like E119 instead of E11.9. The pipeline tries to auto-correct the format. If it can't figure it out it nulls the field and flags the record.
+
+Claim amount outliers get scored using IQR. They don't get dropped because sometimes a $50k claim is legitimate, it just needs a human to review it. The score travels with the record so analysts can filter on it.
+
+Everything else that fails validation goes to the quarantine table with a specific reason code so someone can actually act on it.
 
 ---
 
-## how to run
+## numbers from the sample run
 
-needs Python 3.10+ and Docker for the local Airflow/postgres setup
+```
+records in:        10,200
+duplicates found:     200  removed before load
+bad ICD-10 codes:      51  nulled and flagged
+amount outliers:       98  sent to quarantine
+anomaly flagged:      441  scored above 0.5, kept in main pipeline
+clean records out:  9,902
+quality score:      97.1%
+runtime:            around 20 seconds
+```
 
-clone and install:
-
-    git clone https://github.com/phanikan/healthcare-etl-pipeline
-    cd healthcare-etl-pipeline
-    python -m venv venv && source venv/bin/activate
-    pip install -r requirements.txt
-
-make some test data and run:
-
-    python src/utils/data_generator.py --rows 10000
-    python src/run_pipeline.py --source data/raw/claims_sample.csv --dry-run
-
-(--dry-run skips the db write, just shows output)
-
-full local setup with Airflow:
-
-    cp .env.example .env
-    # fill in db credentials in .env
-    docker-compose up -d
-    # Airflow at localhost:8080, admin/admin
-
-tests:
-
-    pytest tests/ -v
-    # should be 17 passing
-
----
-
-## output from a sample run
-
-10k synthetic claims:
-
-    records in:            10,200
-    duplicates removed:       200
-    ICD-10 corrections:        51
-    amount outliers flagged:   98  -> quarantine
-    clean records loaded:   9,902
-    data quality score:     97.1%
+I generated synthetic data to match what real MedCore exports looked like, same rough proportions of duplicates and bad codes we used to see.
 
 ---
 
 ## stack
 
-- Python + Pandas for transforms
-- Airflow for scheduling
-- PostgreSQL, star schema
-- Azure Data Lake for parquet storage
-- Docker Compose for local dev
+Python and Pandas for the transform logic. Thought about PySpark but the volume doesn't need it.
 
-looked at PySpark first but the volume didn't need it. Pandas is fine.
+Apache Airflow for scheduling, retries, and the email alert that fires when the quality gate fails before transform runs.
+
+PostgreSQL for the warehouse. Star schema because the queries are analytical, not transactional.
+
+Azure Data Lake for the parquet output. Matches what MedCore was using for their BI layer.
+
+Docker Compose so local setup is one command instead of a whole afternoon.
+
+Great Expectations is partially integrated. Still figuring out how to use it inside an Airflow DAG without it generating more noise than signal.
 
 ---
 
 ## folder structure
 
-    dags/                    Airflow DAG
-    src/
-      extractors/            reads and normalizes raw files
-      transformers/          dedup, ICD-10, anomaly scoring
-      loaders/               postgres upsert + ADLS parquet
-      utils/                 logger, test data generator
-    tests/                   unit tests
-    notebooks/               EDA I did before building
-    data/raw/                sample CSV for testing
-    docs/schema_design.md    schema docs
+```
+healthcare-etl-pipeline/
+├── dags/
+│   └── healthcare_claims_dag.py
+├── src/
+│   ├── extractors/claims_extractor.py
+│   ├── transformers/claims_transformer.py
+│   ├── loaders/warehouse_loader.py
+│   └── utils/
+│       ├── logger.py
+│       └── data_generator.py
+├── tests/
+│   └── test_transformer.py
+├── data/raw/claims_sample.csv
+├── docs/schema_design.md
+├── docker-compose.yml
+└── requirements.txt
+```
 
 ---
 
-## things I know still need work
+## running it locally
 
-Airflow setup is functional but not production-ready. Secrets are in env vars right now instead of Airflow connections. The DAG is more to show the structure than something you'd actually deploy as-is.
+You need Docker and Python 3.10 or higher.
 
-Anomaly scoring uses global IQR across all claims which creates false positives. A $40k orthopedic procedure gets flagged even though that's normal for that specialty. Need to group by specialty before scoring, just haven't gotten to it.
+```bash
+git clone https://github.com/phanikan/healthcare-etl-pipeline
+cd healthcare-etl-pipeline
 
-Only the transformer has unit tests right now. Extractor and loader need coverage.
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
 
-Want to replace the pandas transform layer with dbt models at some point.
+python src/utils/data_generator.py --rows 10000
+
+python src/run_pipeline.py --source data/raw/claims_sample.csv --dry-run
+
+cp .env.example .env
+docker-compose up -d
+```
+
+Airflow runs at localhost:8080. Username and password are both admin.
+
+```bash
+pytest tests/ -v
+```
+
+17 tests, all passing. They only cover the transformer right now. Extractor and loader tests are still on the list.
+
+---
+
+## what I'd change
+
+The anomaly scoring uses global IQR thresholds right now which is too blunt. A large orthopedic claim looks like an outlier in the model but is completely normal for that claim type. I want to make the thresholds specialty-aware but haven't gotten there yet.
+
+The Airflow DAG needs real secrets management before it's deployable. Right now credentials are just in environment variables which works for local dev but not for anything real.
+
+Things I still want to add: dbt models on top of the warehouse, proper Great Expectations checkpoints wired into the DAG, tests for the extractor and loader, and some kind of simple run history dashboard.
 
 ---
 
 ## schema
 
-star schema, full details in docs/schema_design.md
+Star schema. Full details in docs/schema_design.md.
 
-    fact_claims
-      claim_id, patient_id, provider_npi, payer_name, service_date,
-      icd10_code, cpt_code, claim_amount, approved_amount,
-      denial_code, processing_status, anomaly_score
-
-    dim_provider  (npi, name, specialty)
-    dim_payer     (payer_name, type)
-    dim_date      (date_key, year, quarter, month)
+```
+fact_claims
+    ├── dim_provider
+    ├── dim_payer
+    └── dim_date
+```
 
 ---
 
-phanikumarda@gmail.com
+phani kumar · phanikumarda@gmail.com · [kphani.com](https://www.kphani.com)
